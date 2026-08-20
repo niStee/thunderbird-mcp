@@ -51,6 +51,7 @@ export default [
       "extension/buildinfo.json",
       "extension/httpd.sys.mjs",  // vendored Mozilla httpd, not ours
       ".claude/",
+      "benchmarks/",
     ],
   },
 
