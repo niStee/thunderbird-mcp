@@ -1,7 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-test('Compare Ollama qwen3:8b vs qwen3:14b latency & tool calling response', async () => {
+test('Compare Ollama qwen3:8b vs qwen3:14b latency & tool calling response', async (t) => {
+  try {
+    const probe = await fetch('http://localhost:11434/api/version', { signal: AbortSignal.timeout(1000) });
+    if (!probe.ok) return t.skip('Ollama is not running locally');
+  } catch {
+    return t.skip('Ollama is not running locally');
+  }
+
   const models = ['qwen3:8b', 'qwen3:14b'];
   const results = [];
 
