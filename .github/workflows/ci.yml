@@ -56,3 +56,17 @@ jobs:
             exit 1
           fi
           echo "Versions in sync: $PKG"
+
+  security-scan:
+    name: Dependency & Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: "fs"
+          hide-progress: true
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
