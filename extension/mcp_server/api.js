@@ -5491,6 +5491,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return Math.abs(actualSize - declaredSize) > Math.max(8, declaredSize * 0.05);
             }
 
+            const MESSAGE_STREAM_READ_CHUNK_BYTES = 64 * 1024;
+
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
             // underreport (observed at ~56% of true size for locally-injected mbox
@@ -5498,15 +5500,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // close the stream.
             function readMessageStreamFully(stream, maxBytes) {
               let raw = "";
-              for (let safety = 0; safety < 1024; safety++) {
-                const available = stream.available();
-                if (available <= 0) break;
-                if (typeof maxBytes === "number" && raw.length + available > maxBytes) {
-                  throw new Error(`message too large (> ${maxBytes} bytes)`);
+              const hasByteLimit = typeof maxBytes === "number" && Number.isFinite(maxBytes);
+              while (true) {
+                let available;
+                try {
+                  available = stream.available();
+                } catch (e) {
+                  if (e === Cr.NS_BASE_STREAM_CLOSED || e?.result === Cr.NS_BASE_STREAM_CLOSED) break;
+                  throw e;
                 }
-                const chunk = NetUtil.readInputStreamToString(stream, available);
-                if (!chunk || chunk.length === 0) break;
+                if (available <= 0) break;
+
+                let bytesToRead = Math.min(available, MESSAGE_STREAM_READ_CHUNK_BYTES);
+                if (hasByteLimit) {
+                  // Reading one byte beyond the remaining budget proves overflow
+                  // from returned data, rather than from the available byte count.
+                  bytesToRead = Math.min(bytesToRead, Math.max(1, maxBytes - raw.length + 1));
+                }
+                const chunk = NetUtil.readInputStreamToString(stream, bytesToRead);
+                if (!chunk || chunk.length === 0) {
+                  throw new Error("message stream read made no progress");
+                }
                 raw += chunk;
+                if (hasByteLimit && raw.length > maxBytes) {
+                  const error = new Error(`message too large (> ${maxBytes} bytes)`);
+                  error.isStreamSizeLimit = true;
+                  throw error;
+                }
               }
               return raw;
             }
@@ -5598,7 +5618,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                        rawSource: raw,
 	                      });
 	                    } catch (e) {
-	                      resolve({ error: `Failed to read raw source: ${e}` });
+	                      console.error("thunderbird-mcp: raw source read failed:", e);
+	                      resolve({ error: "Failed to read raw source" });
 	                    } finally {
 	                      if (stream) try { stream.close(); } catch { /* ignore */ }
 	                    }
@@ -5677,7 +5698,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           }
                         }
                       } catch (e) {
-                        bodyNote = String(e?.message || e).startsWith("message too large")
+                        bodyNote = e?.isStreamSizeLimit === true
                           ? "raw MIME body extraction hit 50 MiB size cap"
                           : "raw MIME body extraction failed";
                         console.error(`${fallbackContext}: failed`, e);
@@ -5939,7 +5960,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             uri: source.url,
                             loadUsingSystemPrincipal: true,
                           });
-                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                          NetUtil.asyncFetch(channel, (inputStream, status) => {
                             try {
                               if (status && status !== 0) {
                                 resolve({ error: `Inline image fetch failed: ${status}` });
@@ -5949,37 +5970,36 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 resolve({ error: "Inline image fetch returned no data" });
                                 return;
                               }
-                              const requestLength = request && typeof request.contentLength === "number"
-                                ? request.contentLength
-                                : -1;
-                              if (requestLength > 0 &&
-                                  getBase64EncodedSize(requestLength) > MAX_INLINE_IMAGE_BASE64_BYTES) {
-                                resolve({
-                                  error: `Image exceeds per-image base64 limit (${getBase64EncodedSize(requestLength)} bytes > ${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
-                                });
-                                return;
-                              }
+                              // Message-part channels can report the parent message's
+                              // contentLength, so enforce the limit on bytes read below.
                               // Largest decoded payload whose base64 representation fits
                               // exactly inside the per-image encoded budget.
                               const maxRawBytes = Math.floor(MAX_INLINE_IMAGE_BASE64_BYTES / 4) * 3;
                               let byteString;
                               try {
                                 byteString = readMessageStreamFully(inputStream, maxRawBytes);
-                              } catch {
-                                resolve({
-                                  error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
-                                });
+                              } catch (e) {
+                                if (e?.isStreamSizeLimit === true) {
+                                  resolve({
+                                    error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
+                                  });
+                                } else {
+                                  console.error("thunderbird-mcp: inline image stream read failed:", e);
+                                  resolve({ error: "Inline image read failed" });
+                                }
                                 return;
                               }
                               resolve({ data: encodeByteStringToBase64(byteString) });
                             } catch (e) {
-                              resolve({ error: `Inline image fetch failed: ${e}` });
+                              console.error("thunderbird-mcp: inline image fetch callback failed:", e);
+                              resolve({ error: "Inline image fetch failed" });
                             } finally {
                               try { inputStream?.close(); } catch {}
                             }
                           });
                         } catch (e) {
-                          resolve({ error: `Inline image fetch failed: ${e}` });
+                          console.error("thunderbird-mcp: inline image fetch setup failed:", e);
+                          resolve({ error: "Inline image fetch failed" });
                         }
                       });
                     }
@@ -6059,10 +6079,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       appendInlineImageContent()
                         .then(() => resolve(baseResponse))
                         .catch((e) => {
+                          console.error("thunderbird-mcp: inline image content assembly failed:", e);
                           baseResponse.inlineImageContent = {
                             included: 0,
                             skipped: inlineImageSources.length,
-                            error: `Failed to include inline images: ${e}`,
+                            error: "Failed to include inline images",
                             limits: {
                               perImageBase64Bytes: MAX_INLINE_IMAGE_BASE64_BYTES,
                               totalBase64Bytes: MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
@@ -6267,7 +6288,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             loadUsingSystemPrincipal: true
                           });
 
-                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                          NetUtil.asyncFetch(channel, (inputStream, status) => {
                             try {
                               if (status && status !== 0) {
                                 try { inputStream?.close(); } catch {}
@@ -6283,19 +6304,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 return;
                               }
 
-                              try {
-                                const reqLen = request && typeof request.contentLength === "number" ? request.contentLength : -1;
-                                if (reqLen >= 0 && reqLen > MAX_ATTACHMENT_BYTES) {
-                                  try { inputStream.close(); } catch {}
-                                  info.error = `Attachment too large (${reqLen} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
-                                  try { file.remove(false); } catch {}
-                                  done();
-                                  return;
-                                }
-                              } catch {
-                                // ignore contentLength failures
-                              }
-
+                              // Message-part contentLength can describe the parent
+                              // message. Enforce the limit on the copied file below.
                               const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                                 .createInstance(Ci.nsIFileOutputStream);
                               ostream.init(file, -1, -1, 0);
@@ -6368,7 +6378,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }, true, { examineEncryptedParts: true });
 
 	                } catch (e) {
-	                  resolve({ error: e.toString() });
+	                  console.error("thunderbird-mcp: getMessage failed:", e);
+	                  resolve({ error: "Failed to get message" });
 	                }
 	              });
 	            }
